@@ -1515,6 +1515,18 @@ category = "3D Rendering"
 wasm = false                                                                        # Raytracing is not supported on the web
 
 [[example]]
+name = "solari_white_furnace"
+path = "examples/3d/solari_white_furnace.rs"
+doc-scrape-examples = true
+required-features = ["bevy_solari"]
+
+[package.metadata.example.solari_white_furnace]
+name = "Solari White Furnace"
+description = "White furnace test for the Solari pathtracer BRDF: energy conservation check using a grid of spheres."
+category = "3D Rendering"
+wasm = false
+
+[[example]]
 name = "spherical_area_lights"
 path = "examples/3d/spherical_area_lights.rs"
 doc-scrape-examples = true
