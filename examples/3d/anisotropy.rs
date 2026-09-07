@@ -24,8 +24,8 @@ struct AppStatus {
     visible_scene: Scene,
 }
 
-/// Which type of light we're using: a directional light, a point light, or an
-/// environment map.
+/// Which type of light we're using: a directional light, a point light, a
+/// rectangular area light, or an environment map.
 #[derive(Clone, Copy, PartialEq, Default)]
 enum LightMode {
     /// A rotating directional light.
@@ -33,6 +33,8 @@ enum LightMode {
     Directional,
     /// A rotating point light.
     Point,
+    /// A rotating rectangular area light, shaded with the anisotropic LTC LUT.
+    Rect,
     /// An environment map (image-based lighting, including skybox).
     EnvironmentMap,
 }
@@ -180,7 +182,10 @@ fn create_material_variants(
 
 /// A system that animates the light every frame, if there is one.
 fn animate_light(
-    mut lights: Query<&mut Transform, Or<(With<DirectionalLight>, With<PointLight>)>>,
+    mut lights: Query<
+        &mut Transform,
+        Or<(With<DirectionalLight>, With<PointLight>, With<RectLight>)>,
+    >,
     time: Res<Time>,
 ) {
     let now = time.elapsed_secs();
@@ -215,7 +220,7 @@ fn handle_input(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     cameras: Query<Entity, With<Camera>>,
-    lights: Query<Entity, Or<(With<DirectionalLight>, With<PointLight>)>>,
+    lights: Query<Entity, Or<(With<DirectionalLight>, With<PointLight>, With<RectLight>)>>,
     mut meshes: Query<(&mut MeshMaterial3d<StandardMaterial>, &MaterialVariants)>,
     mut scenes: Query<(&mut Visibility, &Scene)>,
     keyboard: Res<ButtonInput<KeyCode>>,
@@ -235,6 +240,16 @@ fn handle_input(
             }
 
             LightMode::Point => {
+                // Switch to a rectangular area light. Despawn all existing
+                // lights and create the area light.
+                app_status.light_mode = LightMode::Rect;
+                for light in lights.iter() {
+                    commands.entity(light).despawn();
+                }
+                spawn_rect_light(&mut commands);
+            }
+
+            LightMode::Rect => {
                 // Switch to the environment map. Despawn all existing lights,
                 // and create the skybox and environment map.
                 app_status.light_mode = LightMode::EnvironmentMap;
@@ -325,6 +340,27 @@ fn spawn_directional_light(commands: &mut Commands) {
     });
 }
 
+/// Spawns a rotating rectangular area light.
+///
+/// Kept small and square so it reads as closely as possible to the point light: a
+/// non-square light imposes an elongation of its own on the highlight, which is exactly
+/// what makes the anisotropic stretch hard to judge. Any elongation you see here is the
+/// material, not the light.
+///
+/// The intensity is a quarter of the point light's because the two are normalized
+/// differently -- point lights divide their lumens by `4 * PI`, area lights by
+/// `width * height * PI` -- so an area light delivers four times the illuminance per
+/// lumen. This value matches `spawn_point_light` at the same distance.
+fn spawn_rect_light(commands: &mut Commands) {
+    commands.spawn(RectLight {
+        color: WHITE.into(),
+        intensity: 50_000.0,
+        width: 0.4,
+        height: 0.4,
+        range: 20.0,
+    });
+}
+
 /// Spawns a rotating point light.
 fn spawn_point_light(commands: &mut Commands) {
     commands.spawn(PointLight {
@@ -347,7 +383,8 @@ impl AppStatus {
         // Choose the appropriate help text for the light toggle.
         let light_help_text = match self.light_mode {
             LightMode::Directional => "Press Space to switch to a point light",
-            LightMode::Point => "Press Space to switch to an environment map",
+            LightMode::Point => "Press Space to switch to a rect (area) light",
+            LightMode::Rect => "Press Space to switch to an environment map",
             LightMode::EnvironmentMap => "Press Space to switch to a directional light",
         };
 
