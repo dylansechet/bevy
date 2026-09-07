@@ -161,14 +161,29 @@ pub struct Bluenoise {
 
 /// LTC (Linearly Transformed Cosines) LUT textures for area light shading.
 ///
-/// It is a texture array containing 2 LUT textures:
+/// `image` is a texture array containing 2 isotropic LUT textures:
 /// The first entry encodes the 4 non-trivial elements of the inverse GGX LTC matrix.
 /// The second entry encodes amplitude and Fresnel-related weights.
 ///
 /// [LUT source and fitting code](https://github.com/selfshadow/ltc_code/blob/master/fit/results)
+///
+/// `aniso_image` is the anisotropic LUT, used when a material has anisotropy. It is an
+/// 8x8x192 3D texture indexed by `(phi, theta, component * 64 + alpha * 8 + lambda)`, where
+/// `alpha` is the larger of the two GGX roughnesses and `lambda` the ratio of the smaller to
+/// the larger. Hardware filtering covers phi/theta/lambda; the shader interpolates alpha.
+/// Each cell holds the full forward 3x3 GGX LTC matrix plus the amplitude and Fresnel weights:
+///
+/// | component | R | G | B | A |
+/// |-----------|---|---|---|---|
+/// | 0 | `M[0][0]` | `M[0][1]` | `M[0][2]` | `M[1][0]` |
+/// | 1 | `M[1][1]` | `M[1][2]` | `M[2][0]` | `M[2][1]` |
+/// | 2 | `M[2][2]` | amplitude | Fresnel | unused |
+///
+/// [LUT source and fitting code](https://github.com/AakashKT/LTC-Anisotropic)
 #[derive(Resource, Clone)]
 pub struct AreaLightLuts {
     pub image: Handle<Image>,
+    pub aniso_image: Handle<Image>,
 }
 
 // See https://github.com/bevyengine/bevy/pull/23737 for information on how the LUT was generated.
@@ -322,7 +337,27 @@ impl Plugin for PbrPlugin {
             #[cfg(not(feature = "area_light_luts"))]
             let handle = images.add(area_light_luts_placeholder());
 
-            let area_light_luts = AreaLightLuts { image: handle };
+            #[cfg(feature = "area_light_luts")]
+            let aniso_handle = {
+                let mut image = Image::from_buffer(
+                    include_bytes!("ltc/ltc_aniso.ktx2"),
+                    bevy_image::ImageType::Extension("ktx2"),
+                    bevy_image::CompressedImageFormats::NONE,
+                    false,
+                    ImageSampler::linear(),
+                    RenderAssetUsages::RENDER_WORLD,
+                )
+                .expect("Failed to decode embedded anisotropic LTC LUT");
+                image.texture_descriptor.label = Some("area_light_luts_aniso");
+                images.add(image)
+            };
+            #[cfg(not(feature = "area_light_luts"))]
+            let aniso_handle = images.add(area_light_luts_aniso_placeholder());
+
+            let area_light_luts = AreaLightLuts {
+                image: handle,
+                aniso_image: aniso_handle,
+            };
             if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
                 render_app.world_mut().insert_resource(area_light_luts);
             }
@@ -460,6 +495,36 @@ pub fn stbn_placeholder() -> Image {
         },
         sampler: ImageSampler::Default,
         texture_view_descriptor: None,
+        asset_usage: RenderAssetUsages::RENDER_WORLD,
+        copy_on_resize: false,
+    }
+}
+
+/// A 1x1x1 stand-in for the anisotropic LTC LUT, used when the `area_light_luts` feature is
+/// disabled so the bind group layout stays the same.
+pub fn area_light_luts_aniso_placeholder() -> Image {
+    Image {
+        data: Some(vec![0; 8]),
+        data_order: TextureDataOrder::default(),
+        texture_descriptor: TextureDescriptor {
+            size: Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            format: TextureFormat::Rgba16Float,
+            dimension: TextureDimension::D3,
+            label: Some("area_light_luts_aniso_placeholder"),
+            mip_level_count: 1,
+            sample_count: 1,
+            usage: TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        },
+        sampler: ImageSampler::Default,
+        texture_view_descriptor: Some(TextureViewDescriptor {
+            dimension: Some(TextureViewDimension::D3),
+            ..Default::default()
+        }),
         asset_usage: RenderAssetUsages::RENDER_WORLD,
         copy_on_resize: false,
     }

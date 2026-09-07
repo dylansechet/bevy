@@ -451,6 +451,18 @@ fn specular_clearcoat(
     return vec2(Fc, Frc);
 }
 
+// Returns the two GGX roughnesses of an anisotropic material as `vec2(alpha_t, alpha_b)`,
+// where `alpha_t` runs along the anisotropy tangent and is always the larger of the two.
+//
+// This is from the `KHR_materials_anisotropy` spec:
+// <https://github.com/KhronosGroup/glTF/blob/main/extensions/2.0/Khronos/KHR_materials_anisotropy/README.md#individual-lights>
+@if(STANDARD_MATERIAL_ANISOTROPY)
+fn anisotropic_alphas(anisotropy: f32, roughness: f32) -> vec2<f32> {
+    let ab = roughness * roughness;
+    let at = mix(ab, 1.0, anisotropy * anisotropy);
+    return vec2<f32>(at, ab);
+}
+
 @if(STANDARD_MATERIAL_ANISOTROPY)
 fn specular_anisotropy(
     input: ptr<function, LightingInput>,
@@ -478,8 +490,9 @@ fn specular_anisotropy(
     let TdotV = dot(Ta, V);
     let BdotV = dot(Ba, V);
 
-    let ab = roughness * roughness;
-    let at = mix(ab, 1.0, anisotropy * anisotropy);
+    let alphas = anisotropic_alphas(anisotropy, roughness);
+    let at = alphas.x;
+    let ab = alphas.y;
 
     let Da = D_GGX_anisotropic(at, ab, NdotH, TdotH, BdotH);
     let Va = V_GGX_anisotropic(at, ab, NdotL, NdotV, BdotV, TdotV, TdotL, BdotL);
@@ -959,17 +972,19 @@ fn ltc_integrate_edge(v1: vec3<f32>, v2: vec3<f32>) -> f32 {
     return cross(v1, v2).z * theta_sintheta;
 }
 
-fn ltc_integrate_quad(
-    N: vec3<f32>,
-    V: vec3<f32>,
+// Integrate the quad against an LTC lobe.
+//
+// `to_local` rotates world-space directions into the frame the LTC transform is defined in.
+// The isotropic fit uses a view-aligned frame; the anisotropic one uses the tangent frame.
+// Both are left-handed, which is what makes the edge sum come out positive for quads wound
+// the way `rect_light` winds `corners`.
+fn ltc_integrate_quad_local(
+    to_local: mat3x3<f32>,
     P: vec3<f32>,
     Minv: mat3x3<f32>,
     points: array<vec3<f32>, 4>
 ) -> f32 {
-    let T1 = normalize(V - N * dot(V, N));
-    let T2 = -cross(N, T1);
-
-    let Minv_local = Minv * transpose(mat3x3<f32>(T1, T2, N));
+    let Minv_local = Minv * to_local;
 
     // Transform quad vertices into LTC-distorted space
     var L: array<vec3<f32>, 4>;
@@ -1015,6 +1030,164 @@ fn ltc_integrate_quad(
     return sum;
 }
 
+// The LTC lobe to integrate a polygonal light against, as fetched from the LUTs.
+struct LtcLobe {
+    // Rotates world-space directions into the frame the LTC transform is defined in.
+    to_local: mat3x3<f32>,
+    // The inverse LTC transform, up to an arbitrary *positive* scale. The integrator
+    // normalizes the transformed vertices, so only the directions matter.
+    Minv: mat3x3<f32>,
+    // Corrects the polygon orientation when the lobe has been mirrored.
+    orientation: f32,
+    // Split-sum specular weights: (magnitude, Fresnel).
+    weights: vec2<f32>,
+}
+
+@if(AREA_LIGHT_LUTS)
+fn ltc_lobe_isotropic(
+    N: vec3<f32>,
+    V: vec3<f32>,
+    perceptual_roughness: f32,
+    NdotV: f32,
+) -> LtcLobe {
+    let LUT_SCALE = 63.0 / 64.0;
+    let LUT_BIAS  =  0.5 / 64.0;
+    let uv = vec2<f32>(perceptual_roughness, sqrt(1.0 - NdotV)) * LUT_SCALE + LUT_BIAS;
+    let t1 = textureSampleLevel(view_bindings::area_light_luts, view_bindings::area_light_luts_sampler, uv, 0, 0.0);
+    let t2 = textureSampleLevel(view_bindings::area_light_luts, view_bindings::area_light_luts_sampler, uv, 1, 0.0);
+
+    // The isotropic fit is defined in a frame whose x axis is the view azimuth, which is
+    // what lets it drop the azimuth from the LUT entirely.
+    let T1 = normalize(V - N * dot(V, N));
+    let T2 = -cross(N, T1);
+
+    var lobe: LtcLobe;
+    lobe.to_local = transpose(mat3x3<f32>(T1, T2, N));
+    // Reconstruct the GGX inverse-LTC matrix; the LUT stores its 4 non-trivial elements.
+    lobe.Minv = mat3x3<f32>(
+        vec3<f32>(t1.x, 0.0, t1.y),
+        vec3<f32>(0.0,  1.0, 0.0),
+        vec3<f32>(t1.z, 0.0, t1.w),
+    );
+    lobe.orientation = 1.0;
+    lobe.weights = t2.xy;
+    return lobe;
+}
+
+// Anisotropic LTC, from Kt et al. 2022, "Bringing Linearly Transformed Cosines to
+// Anisotropic GGX" <https://arxiv.org/abs/2203.11904>.
+//
+// The LUT is an 8x8x192 3D texture holding a 4D table indexed by
+// `(phi, theta, alpha, lambda)`, where `alpha` is the larger GGX roughness and `lambda` the
+// ratio of the smaller to the larger. `alpha` and `lambda` share the z axis as
+// `component * 64 + alpha * 8 + lambda`, so hardware filtering covers phi/theta/lambda
+// while alpha is interpolated here between two slabs. See `AreaLightLuts` for the packing.
+@if(AREA_LIGHT_LUTS && STANDARD_MATERIAL_ANISOTROPY)
+struct LtcAnisoData {
+    // The forward LTC transform.
+    m: mat3x3<f32>,
+    // Split-sum specular weights: (magnitude, Fresnel).
+    weights: vec2<f32>,
+}
+
+@if(AREA_LIGHT_LUTS && STANDARD_MATERIAL_ANISOTROPY)
+fn ltc_aniso_fetch(alpha: f32, lambda: f32, theta01: f32, phi01: f32) -> LtcAnisoData {
+    let a = saturate(alpha) * 7.0;
+    let a_floor = floor(a);
+    let a_ceil = min(a_floor + 1.0, 7.0);
+    let a_frac = a - a_floor;
+
+    let uv = (vec2<f32>(saturate(phi01), saturate(theta01)) * 7.0 + 0.5) / 8.0;
+    let lambda_texel = saturate(lambda) * 7.0;
+
+    var t: array<vec4<f32>, 3>;
+    for (var c = 0; c < 3; c++) {
+        // Staying within one alpha slab means hardware filtering along z only ever
+        // interpolates lambda, never across alpha or across components.
+        let base = lambda_texel + 64.0 * f32(c) + 0.5;
+        let z0 = (base + 8.0 * a_floor) / 192.0;
+        let z1 = (base + 8.0 * a_ceil) / 192.0;
+        let s0 = textureSampleLevel(view_bindings::area_light_luts_aniso, view_bindings::area_light_luts_sampler, vec3<f32>(uv, z0), 0.0);
+        let s1 = textureSampleLevel(view_bindings::area_light_luts_aniso, view_bindings::area_light_luts_sampler, vec3<f32>(uv, z1), 0.0);
+        t[c] = mix(s0, s1, a_frac);
+    }
+
+    var data: LtcAnisoData;
+    // The matrix is stored row-major across the three components.
+    data.m = transpose(mat3x3<f32>(
+        vec3<f32>(t[0].x, t[0].y, t[0].z),
+        vec3<f32>(t[0].w, t[1].x, t[1].y),
+        vec3<f32>(t[1].z, t[1].w, t[2].x),
+    ));
+    data.weights = vec2<f32>(t[2].y, t[2].z);
+    return data;
+}
+
+// Returns a positive multiple of `inverse(m)`.
+//
+// `adjugate(m) == determinant(m) * inverse(m)`, and its rows are the cross products of the
+// columns of `m`. Since the integrator normalizes the transformed vertices, any positive
+// multiple of the inverse will do, so we can skip the division by the determinant and only
+// need its sign. This also stays well behaved for the near-singular matrices the fit
+// produces at very low roughness.
+@if(AREA_LIGHT_LUTS && STANDARD_MATERIAL_ANISOTROPY)
+fn ltc_inverse_scaled(m: mat3x3<f32>) -> mat3x3<f32> {
+    let r0 = cross(m[1], m[2]);
+    let r1 = cross(m[2], m[0]);
+    let r2 = cross(m[0], m[1]);
+    let s = select(-1.0, 1.0, dot(m[0], r0) >= 0.0);
+    return transpose(mat3x3<f32>(r0 * s, r1 * s, r2 * s));
+}
+
+@if(AREA_LIGHT_LUTS && STANDARD_MATERIAL_ANISOTROPY)
+fn ltc_lobe_anisotropic(
+    input: ptr<function, LightingInput>,
+    N: vec3<f32>,
+    V: vec3<f32>,
+    NdotV: f32,
+    roughness: f32,
+) -> LtcLobe {
+    // Anisotropy is defined relative to the surface tangent, so unlike the isotropic case
+    // we have to work in the tangent frame and feed the view azimuth to the LUT. The
+    // bitangent is negated to make the frame left-handed like the isotropic one, so that
+    // both the specular and the diffuse integrals come out with the same sign convention.
+    let to_local = transpose(mat3x3<f32>((*input).Ta, -(*input).Ba, N));
+    let wo = to_local * V;
+
+    let alphas = anisotropic_alphas((*input).anisotropy, roughness);
+    let at = alphas.x;
+    let ab = alphas.y;
+
+    // The fit only covers an azimuth of [0, pi/2]. Anisotropic GGX is symmetric under
+    // x -> -x and y -> -y, so fold the azimuth into that quadrant and mirror the fitted
+    // matrix back afterwards.
+    let sx = select(-1.0, 1.0, wo.x >= 0.0);
+    let sy = select(-1.0, 1.0, wo.y >= 0.0);
+
+    // 2 / pi, to map an angle in [0, pi/2] onto the LUT axes.
+    let INV_HALF_PI = 0.63661977;
+    let data = ltc_aniso_fetch(
+        at,
+        ab / max(at, 1e-6),
+        acos(saturate(NdotV)) * INV_HALF_PI,
+        atan2(abs(wo.y), abs(wo.x)) * INV_HALF_PI,
+    );
+
+    // Mirror: `m <- diag(sx, sy, 1) * m`, i.e. scale the first two rows.
+    let mirror = vec3<f32>(sx, sy, 1.0);
+    let m = data.m;
+    let mirrored = mat3x3<f32>(m[0] * mirror, m[1] * mirror, m[2] * mirror);
+
+    var lobe: LtcLobe;
+    lobe.to_local = to_local;
+    lobe.Minv = ltc_inverse_scaled(mirrored);
+    // A mirror with a negative determinant reverses the polygon winding, which negates the
+    // edge sum. Cheaper than actually reversing the vertex order.
+    lobe.orientation = sx * sy;
+    lobe.weights = data.weights;
+    return lobe;
+}
+
 @if(AREA_LIGHT_LUTS)
 fn rect_light(
     light_id: u32,
@@ -1049,31 +1222,27 @@ fn rect_light(
         return vec3<f32>(0.0);
     }
 
-    let LUT_SCALE = 63.0 / 64.0;
-    let LUT_BIAS  =  0.5 / 64.0;
-    let uv = vec2<f32>(perceptual_roughness, sqrt(1.0 - NdotV)) * LUT_SCALE + LUT_BIAS;
-    let t1 = textureSampleLevel(view_bindings::area_light_luts, view_bindings::area_light_luts_sampler, uv, 0, 0.0);
-    let t2 = textureSampleLevel(view_bindings::area_light_luts, view_bindings::area_light_luts_sampler, uv, 1, 0.0);
+@if(STANDARD_MATERIAL_ANISOTROPY)
+    let lobe = ltc_lobe_anisotropic(input, N, V, NdotV, (*input).layers[LAYER_BASE].roughness);
+@else   // STANDARD_MATERIAL_ANISOTROPY
+    let lobe = ltc_lobe_isotropic(N, V, perceptual_roughness, NdotV);
 
-    // Reconstruct the GGX inverse-LTC matrix
-    let Minv = mat3x3<f32>(
-        vec3<f32>(t1.x, 0.0, t1.y),
-        vec3<f32>(0.0,  1.0, 0.0),
-        vec3<f32>(t1.z, 0.0, t1.w),
-    );
-    let spec = ltc_integrate_quad(N, V, P, Minv, corners);
+    let spec = lobe.orientation * ltc_integrate_quad_local(lobe.to_local, P, lobe.Minv, corners);
 
-    // Use Lambertian diffuse, Burley would require a second LUT
+    // Use Lambertian diffuse, Burley would require a second LUT.
+    //
+    // The cosine integral only depends on the frame's z axis, so it does not matter which
+    // of the two frames we use here as long as the handedness matches.
     let identity = mat3x3<f32>(
         vec3<f32>(1.0, 0.0, 0.0),
         vec3<f32>(0.0, 1.0, 0.0),
         vec3<f32>(0.0, 0.0, 1.0),
     );
-    let diff = select(0.0, ltc_integrate_quad(N, V, P, identity, corners), enable_diffuse);
+    let diff = select(0.0, ltc_integrate_quad_local(lobe.to_local, P, identity, corners), enable_diffuse);
 
-    // t2.x encodes the bsdf magnitude and t2.y the fresnel direction
+    // weights.x encodes the bsdf magnitude and weights.y the fresnel direction
     let F0 = mix((*input).F0_dielectric, (*input).F0_metallic, (*input).metallic);
-    let spec_weight = F0 * t2.x + (1.0 - F0) * t2.y;
+    let spec_weight = F0 * lobe.weights.x + (1.0 - F0) * lobe.weights.y;
 
 @if(STANDARD_MATERIAL_CLEARCOAT) {
     let clearcoat_N = (*input).layers[LAYER_CLEARCOAT].N;
@@ -1081,19 +1250,13 @@ fn rect_light(
     let clearcoat_perceptual_roughness = (*input).layers[LAYER_CLEARCOAT].perceptual_roughness;
     let clearcoat_NdotV = (*input).layers[LAYER_CLEARCOAT].NdotV;
 
-    // Sample LUTs for clearcoat layer
-    let cc_uv = vec2<f32>(clearcoat_perceptual_roughness, sqrt(1.0 - clearcoat_NdotV)) * LUT_SCALE + LUT_BIAS;
-    let tc1 = textureSampleLevel(view_bindings::area_light_luts, view_bindings::area_light_luts_sampler, cc_uv, 0, 0.0);
-    let tc2 = textureSampleLevel(view_bindings::area_light_luts, view_bindings::area_light_luts_sampler, cc_uv, 1, 0.0);
-    let Minv_cc = mat3x3<f32>(
-        vec3<f32>(tc1.x, 0.0, tc1.y),
-        vec3<f32>(0.0,   1.0, 0.0),
-        vec3<f32>(tc1.z, 0.0, tc1.w),
-    );
-    let spec_cc = ltc_integrate_quad(clearcoat_N, V, P, Minv_cc, corners);
+    // Sample LUTs for clearcoat layer. Clearcoat is always isotropic in Bevy, so this
+    // stays on the cheaper isotropic path even for anisotropic base layers.
+    let cc_lobe = ltc_lobe_isotropic(clearcoat_N, V, clearcoat_perceptual_roughness, clearcoat_NdotV);
+    let spec_cc = cc_lobe.orientation * ltc_integrate_quad_local(cc_lobe.to_local, P, cc_lobe.Minv, corners);
 
     // Clearcoat has F0=0.04
-    let spec_weight_cc = 0.04 * tc2.x + (1.0 - 0.04) * tc2.y;
+    let spec_weight_cc = 0.04 * cc_lobe.weights.x + (1.0 - 0.04) * cc_lobe.weights.y;
     let Fc = clearcoat_strength * spec_weight_cc;
     let inv_Fc = 1.0 - Fc;
 

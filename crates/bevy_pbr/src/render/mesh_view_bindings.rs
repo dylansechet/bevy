@@ -474,6 +474,8 @@ fn layout_entries(
                 texture_2d_array(TextureSampleType::Float { filterable: true }),
             ),
             (36, sampler(SamplerBindingType::Filtering)),
+            // Anisotropic LTC LUT. Shares the sampler at binding 36.
+            (39, texture_3d(TextureSampleType::Float { filterable: true })),
         ));
     }
     // DFG LUT
@@ -893,7 +895,15 @@ pub fn prepare_mesh_view_bind_groups(
                         &fallback_image.d2_array.texture_view,
                         &fallback_image.d2_array.sampler,
                     ));
-                entries = entries.extend_with_indices(((35, ltc_view), (36, ltc_sampler)));
+                let ltc_aniso_view = images
+                    .get(&area_light_luts.aniso_image)
+                    .map(|img| &img.texture_view)
+                    .unwrap_or(&fallback_image.d3.texture_view);
+                entries = entries.extend_with_indices((
+                    (35, ltc_view),
+                    (36, ltc_sampler),
+                    (39, ltc_aniso_view),
+                ));
             }
 
             // DFG LUT

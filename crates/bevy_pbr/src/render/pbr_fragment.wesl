@@ -619,7 +619,7 @@ pbr_input.material.uv_transform = uv_transform;
         //
         // This code comes from the `KHR_materials_anisotropy` spec:
         // <https://github.com/KhronosGroup/glTF/blob/main/extensions/2.0/Khronos/KHR_materials_anisotropy/README.md#individual-lights>
-@if(PBR_ANISOTROPY_TEXTURE_SUPPORTED && VERTEX_TANGENTS && STANDARD_MATERIAL_ANISOTROPY) {
+@if(VERTEX_TANGENTS && STANDARD_MATERIAL_ANISOTROPY) {
 
 @if(BINDLESS)
         var anisotropy_strength =
@@ -633,6 +633,12 @@ pbr_input.material.uv_transform = uv_transform;
         var anisotropy_direction = pbr_bindings::material.anisotropy_rotation;
 
         // Adjust based on the anisotropy map if there is one.
+        //
+        // Only the *texture* lookup depends on `pbr_anisotropy_texture`. The anisotropy
+        // direction and strength below must be set regardless, otherwise `anisotropy_T`
+        // and `anisotropy_B` stay zero while `STANDARD_MATERIAL_ANISOTROPY` is enabled,
+        // which leaves every consumer with a degenerate tangent frame.
+@if(PBR_ANISOTROPY_TEXTURE_SUPPORTED) {
         if ((flags & pbr_types::STANDARD_MATERIAL_FLAGS_ANISOTROPY_TEXTURE_BIT) != 0u) {
             @if(BINDLESS)
             let texture = bindless_textures_2d[material_indices[slot].anisotropy_texture];
@@ -658,6 +664,7 @@ pbr_input.material.uv_transform = uv_transform;
                 anisotropy_direction_from_texture;
             anisotropy_strength *= anisotropy_texel.b;
         }
+}
 
         pbr_input.anisotropy_strength = anisotropy_strength;
 

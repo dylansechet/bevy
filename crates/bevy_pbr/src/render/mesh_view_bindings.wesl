@@ -103,6 +103,8 @@ const VISIBILITY_RANGE_UNIFORM_BUFFER_SIZE: u32 = 64u;
 @if(AREA_LIGHT_LUTS) {
 @group(0) @binding(35) var area_light_luts: texture_2d_array<f32>;
 @group(0) @binding(36) var area_light_luts_sampler: sampler;
+// Anisotropic LTC LUT, sampled with `area_light_luts_sampler`.
+@group(0) @binding(39) var area_light_luts_aniso: texture_3d<f32>;
 }
 
 @if(DFG_LUT) {
