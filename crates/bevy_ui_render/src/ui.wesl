@@ -1,4 +1,5 @@
 import bevy_render::view::View;
+import bevy_render::color_operations::{gamma, inverse_gamma};
 
 const TEXTURED = 1u;
 const RIGHT_VERTEX = 2u;
@@ -10,6 +11,41 @@ const BORDER_RIGHT: u32 = 1024u;
 const BORDER_BOTTOM: u32 = 2048u;
 const BORDER_ANY: u32 = BORDER_LEFT + BORDER_TOP + BORDER_RIGHT + BORDER_BOTTOM;
 const INVERT: u32 = 4096u;
+const TEXT: u32 = 8192u;
+
+// Text rendering settings: blending is done in gamma space, and a small contrast boost is applied to dark text.
+// Values are chosen to match Chromium on Linux: https://github.com/chromium/chromium/blob/6879725d1e8848235cb497e9d055ac6cfbff273d/skia/BUILD.gn#L113-L119
+const TEXT_GAMMA: f32 = 1.2;
+const TEXT_CONTRAST: f32 = 0.2;
+
+// Port of https://github.com/google/skia/blob/4f52b289492aaed4941668b18100674cf8baaca1/src/core/SkMaskGamma.cpp#L78
+// Remaps glyph coverage so a linear blend is equivalent to a blend in `TEXT_GAMMA` space.
+fn preblend_coverage(coverage: f32, text_color: vec3<f32>) -> f32 {
+    let text_luma = dot(
+        vec3(inverse_gamma(text_color.r), inverse_gamma(text_color.g), inverse_gamma(text_color.b)),
+        vec3(0.2126, 0.7152, 0.0722),
+    );
+    let background_luma = 1.0 - text_luma;
+    let text_in_gamma_space = pow(text_luma, TEXT_GAMMA);
+    let background_in_gamma_space = pow(background_luma, TEXT_GAMMA);
+
+    // Slightly boost dark text coverage
+    let boosted_coverage = mix(coverage, 1.0, TEXT_CONTRAST * background_in_gamma_space * coverage);
+
+    // Text color too close to its assumed background for the correction to be stable.
+    if abs(text_luma - background_luma) < 1.0 / 256.0 {
+        return boosted_coverage;
+    }
+
+    // Blend in gamma space, then solve for the coverage that makes our linear blend hit it.
+    let blended = pow(
+        mix(background_in_gamma_space, text_in_gamma_space, boosted_coverage),
+        1.0 / TEXT_GAMMA,
+    );
+    let text_linear = gamma(text_luma);
+    let background_linear = gamma(background_luma);
+    return saturate((gamma(blended) - background_linear) / (text_linear - background_linear));
+}
 
 fn enabled(flags: u32, mask: u32) -> bool {
     return (flags & mask) != 0u;
@@ -257,7 +293,10 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Only use the color sampled from the texture if the `TEXTURED` flag is enabled.
     // This allows us to draw both textured and untextured shapes together in the same batch.
-    let color = select(in.color, in.color * texture_color, enabled(in.flags, TEXTURED));
+    var color = select(in.color, in.color * texture_color, enabled(in.flags, TEXTURED));
+    if enabled(in.flags, TEXT) {
+        color.a = in.color.a * preblend_coverage(texture_color.a, in.color.rgb);
+    }
 
     if enabled(in.flags, BORDER_ANY) {
         return draw_uinode_border(color, in.point, in.size, in.radius_x, in.radius_y, in.border, in.flags);

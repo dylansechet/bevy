@@ -398,6 +398,8 @@ pub struct ExtractedGlyph {
     pub color: LinearRgba,
     pub translation: Vec2,
     pub rect: Rect,
+    /// True if the glyph is a tintable coverage mask (as opposed to a color glyph such as an emoji).
+    pub is_alpha_mask: bool,
 }
 
 /// The list of UI nodes, as well as the set of nodes that changed.
@@ -1739,6 +1741,7 @@ pub fn extract_text_sections(
                 color,
                 translation: *position,
                 rect: atlas_info.rect,
+                is_alpha_mask: atlas_info.is_alpha_mask,
             });
 
             if text_layout_info
@@ -1842,6 +1845,7 @@ pub fn extract_text_shadows(
                 color: shadow.color.into(),
                 translation: *position,
                 rect: atlas_info.rect,
+                is_alpha_mask: atlas_info.is_alpha_mask,
             });
 
             if text_layout_info.glyphs.get(i + 1).is_none_or(|info| {
@@ -2201,6 +2205,8 @@ pub mod shader_flags {
     pub const BORDER_BOTTOM: u32 = 2048;
     pub const BORDER_ALL: u32 = BORDER_LEFT + BORDER_TOP + BORDER_RIGHT + BORDER_BOTTOM;
     pub const INVERT: u32 = 4096;
+    /// Texture is a glyph coverage mask
+    pub const TEXT: u32 = 8192;
 }
 
 pub fn queue_uinodes(
@@ -2555,7 +2561,11 @@ pub fn prepare_uinodes(
                                     position: vertex.0.extend(0.).into(),
                                     uv: vertex.1.into(),
                                     color,
-                                    flags: shader_flags::TEXTURED,
+                                    flags: if glyph.is_alpha_mask {
+                                        shader_flags::TEXTURED | shader_flags::TEXT
+                                    } else {
+                                        shader_flags::TEXTURED
+                                    },
                                     radius: [[0.0; 4]; 2],
                                     border: [0.0; 4],
                                     size: rect_size.into(),
